@@ -1,481 +1,630 @@
 # BILN - Python-based Interactive Lab Notebook for Bioinformaticians
-#Author: Jimmy X.
-
+#Author: Jimmy X Banda.
+#!/usr/bin/env python3
+import psutil
 import os
+import platform
+import shutil
 import sqlite3
-import json
-from datetime import datetime
 import pandas as pd
-import numpy as np
-from Bio import SeqIO
-# from Bio.SeqUtils import GC
-import matplotlib.pyplot as plt
-import seaborn as sns
-from fpdf import FPDF
-import re
+import hashlib
+import subprocess
+import json
+import time
+import sys
+import textwrap
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich.syntax import Syntax
 
 
-class Experiment:
-    """Manages a single bioinformatics experiment."""
+app = typer.Typer(
+    help="BILN V4.0: The Complete Bioinformatician's Interactive Lab Notebook.\n\nTrack your science, provenance, and system metrics automatically.",
+    add_completion=False 
+)
+console = Console()
+BILN_DIR = Path(".biln")
+DB_PATH = BILN_DIR / "biln_v4.db"
 
-    def __init__(self, name, description, dataset_metadata):
-        """
-        Initializes a new Experiment.
+try:
+    import pysam
+except ImportError:
+    pysam = None
 
-        Args:
-            name (str): The name of the experiment.
-            description (str): A brief description of the experiment.
-            dataset_metadata (dict): Metadata about the dataset being used.
-        """
-        self.id = None
-        self.name = name
-        self.description = description
-        self.dataset_metadata = json.dumps(dataset_metadata)
-        self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.steps = []
+# --- DATABASE & PROJECT CORE ---
 
-    def add_step(self, step):
-        """
-        Adds a new analysis step to the experiment.
-
-        Args:
-            step (Step): The Step object to add.
-        """
-        self.steps.append(step)
-
-    def save(self, conn):
-        """
-        Saves the experiment to the database.
-
-        Args:
-            conn: SQLite database connection object.
-        """
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO experiments (name, description, dataset_metadata, timestamp)
-            VALUES (?, ?, ?, ?)
-        ''', (self.name, self.description, self.dataset_metadata, self.timestamp))
-        self.id = cursor.lastrowid
-        conn.commit()
-        print(f"Experiment '{self.name}' saved with ID: {self.id}")
-
-    @staticmethod
-    def view_all(conn):
-        """
-        Retrieves and displays all experiments from the database.
-
-        Args:
-            conn: SQLite database connection object.
-        """
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM experiments")
-        rows = cursor.fetchall()
-        if not rows:
-            print("No experiments found.")
-            return
-        print("\n--- All Experiments ---")
-        for row in rows:
-            print(f"ID: {row[0]}, Name: {row[1]}, Description: {row[2]}, Timestamp: {row[4]}")
-        print("-----------------------\n")
-
-    @staticmethod
-    def load(conn, experiment_id):
-        """
-        Loads an experiment and its steps from the database.
-
-        Args:
-            conn: SQLite database connection object.
-            experiment_id (int): The ID of the experiment to load.
-
-        Returns:
-            Experiment: The loaded Experiment object.
-        """
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM experiments WHERE id = ?", (experiment_id,))
-        row = cursor.fetchone()
-        if row:
-            exp = Experiment(row[1], row[2], json.loads(row[3]))
-            exp.id = row[0]
-            exp.timestamp = row[4]
-
-            cursor.execute("SELECT * FROM steps WHERE experiment_id = ?", (experiment_id,))
-            steps_data = cursor.fetchall()
-            for step_row in steps_data:
-                step = Step(step_row[2], json.loads(step_row[3]), json.loads(step_row[4]))
-                step.id = step_row[0]
-                step.timestamp = step_row[5]
-                exp.add_step(step)
-            return exp
-        return None
-
-
-class Step:
-    """Represents a single analysis step in an experiment."""
-
-    def __init__(self, action_name, input_summary, output_summary):
-        """
-        Initializes a new Step.
-
-        Args:
-            action_name (str): The name of the analysis action performed.
-            input_summary (dict): A summary of the input data.
-            output_summary (dict): A summary of the output results.
-        """
-        self.id = None
-        self.action_name = action_name
-        self.input_summary = json.dumps(input_summary)
-        self.output_summary = json.dumps(output_summary)
-        self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    def save(self, conn, experiment_id):
-        """
-        Saves the step to the database.
-
-        Args:
-            conn: SQLite database connection object.
-            experiment_id (int): The ID of the parent experiment.
-        """
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO steps (experiment_id, action_name, input_summary, output_summary, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (experiment_id, self.action_name, self.input_summary, self.output_summary, self.timestamp))
-        self.id = cursor.lastrowid
-        conn.commit()
-
-
-class Analysis:
-    """Contains methods for various bioinformatics analyses."""
-
-    def __init__(self, experiment):
-        self.experiment = experiment
-        self.project_folder = f"experiment_{self.experiment.id}_{self.experiment.name.replace(' ', '_')}"
-        if not os.path.exists(self.project_folder):
-            os.makedirs(self.project_folder)
-
-    def _log_step(self, conn, action_name, input_summary, output_summary):
-        """Creates and saves a Step object."""
-        step = Step(action_name, input_summary, output_summary)
-        step.save(conn, self.experiment.id)
-        self.experiment.add_step(step)
-        print(f"Logged step: {action_name}")
-
-    def get_sequence_stats(self, conn, file_path):
-        """
-        Calculates basic statistics for a sequence file.
-
-        Args:
-            conn: SQLite database connection object.
-            file_path (str): The path to the FASTA or FASTQ file.
-        """
-        try:
-            file_type = "fasta" if file_path.endswith((".fasta", ".fa")) else "fastq"
-            records = list(SeqIO.parse(file_path, file_type))
-            if not records:
-                print("Error: No sequences found in the file.")
-                return
-
-            lengths = [len(rec) for rec in records]
-            #gc_contents = [GC(rec.seq) for rec in records]
-
-            stats = {
-                "total_sequences": len(records),
-                "avg_length": np.mean(lengths),
-                "max_length": np.max(lengths),
-                "min_length": np.min(lengths)
-                
-            }
-
-            # Visualization
-            self._plot_length_distribution(lengths)
-
-            input_summary = {"file_path": file_path}
-            output_summary = {"stats": stats, "plots": [os.path.join(self.project_folder, "length_distribution.png"),
-                                                        os.path.join(self.project_folder, "gc_content.png")]}
-            self._log_step(conn, "Sequence Stats", input_summary, output_summary)
-
-        except Exception as e:
-            print(f"An error occurred: {e}")
-
-    def motif_search(self, conn, file_path, motif):
-        """
-        Searches for a given motif in a FASTA or CSV file.
-
-        Args:
-            conn: SQLite database connection object.
-            file_path (str): The path to the input file.
-            motif (str): The motif to search for.
-        """
-        found_motifs = []
-        if file_path.endswith((".fasta", ".fa", ".fastq")):
-            file_type = "fasta" if file_path.endswith((".fasta", ".fa")) else "fastq"
-            for record in SeqIO.parse(file_path, file_type):
-                for match in re.finditer(motif, str(record.seq)):
-                    found_motifs.append({
-                        "sequence_id": record.id,
-                        "start": match.start(),
-                        "end": match.end()
-                    })
-        elif file_path.endswith(".csv"):
-            df = pd.read_csv(file_path)
-            # Assuming the sequence is in a column named 'sequence'
-            for index, row in df.iterrows():
-                for match in re.finditer(motif, row['sequence']):
-                    found_motifs.append({
-                        "row_index": index,
-                        "start": match.start(),
-                        "end": match.end()
-                    })
-        else:
-            print("Unsupported file type for motif search.")
-            return
-
-        input_summary = {"file_path": file_path, "motif": motif}
-        output_summary = {"found_motifs": found_motifs}
-        self._log_step(conn, "Motif Search", input_summary, output_summary)
-
-    def rna_seq_qc(self, conn, counts_file):
-        """
-        Generates a basic QC summary for RNA-seq count data.
-
-        Args:
-            conn: SQLite database connection object.
-            counts_file (str): Path to a CSV file with gene counts.
-        """
-        try:
-            counts_df = pd.read_csv(counts_file, index_col=0)
-            summary = {
-                "num_genes": counts_df.shape[0],
-                "num_samples": counts_df.shape[1],
-                "total_counts_per_sample": counts_df.sum().to_dict()
-            }
-
-            # Visualization
-            self._plot_expression_heatmap(counts_df)
-
-            input_summary = {"counts_file": counts_file}
-            output_summary = {"summary": summary, "heatmap": os.path.join(self.project_folder, "expression_heatmap.png")}
-            self._log_step(conn, "RNA-seq QC", input_summary, output_summary)
-
-        except Exception as e:
-            print(f"An error occurred during RNA-seq QC: {e}")
-
-    def _plot_length_distribution(self, lengths):
-        """Generates and saves a plot of sequence length distribution."""
-        plt.figure(figsize=(10, 6))
-        sns.histplot(lengths, kde=True)
-        plt.title("Sequence Length Distribution")
-        plt.xlabel("Sequence Length (bp)")
-        plt.ylabel("Frequency")
-        plt.savefig(os.path.join(self.project_folder, "length_distribution.png"))
-        plt.close()
-
-    def _plot_gc_content(self, gc_contents):
-        """Generates and saves a plot of GC content."""
-        plt.figure(figsize=(10, 6))
-        sns.histplot(gc_contents, kde=True)
-        plt.title("GC Content Distribution")
-        plt.xlabel("GC Content (%)")
-        plt.ylabel("Frequency")
-        plt.savefig(os.path.join(self.project_folder, "gc_content.png"))
-        plt.close()
-
-    def _plot_expression_heatmap(self, counts_df):
-        """Generates and saves an expression heatmap."""
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(np.log1p(counts_df.head(50)), cmap="viridis") # Heatmap of top 50 genes
-        plt.title("Gene Expression Heatmap (Top 50 Genes)")
-        plt.xlabel("Samples")
-        plt.ylabel("Genes")
-        plt.savefig(os.path.join(self.project_folder, "expression_heatmap.png"))
-        plt.close()
-
-# --- Database & Persistence ---
-
-def setup_database():
-    """Sets up the SQLite database and creates tables."""
-    conn = sqlite3.connect("biln.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS experiments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT,
-            dataset_metadata TEXT,
-            timestamp TEXT
+def get_db():
+    BILN_DIR.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, name TEXT UNIQUE, active INTEGER)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY, project_id INTEGER, timestamp TEXT, 
+            category TEXT, content TEXT, cmd TEXT, tool_version TEXT,
+            git_hash TEXT, runtime REAL, env_info TEXT, exit_code INTEGER
         )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS steps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            experiment_id INTEGER,
-            action_name TEXT NOT NULL,
-            input_summary TEXT,
-            output_summary TEXT,
-            timestamp TEXT,
-            FOREIGN KEY (experiment_id) REFERENCES experiments (id)
-        )
-    ''')
-    conn.commit()
+    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, project_id INTEGER, path TEXT, hash TEXT, metrics TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS lineage (id INTEGER PRIMARY KEY, log_id INTEGER, input_file_id INTEGER, output_file_id INTEGER)")
     return conn
 
-# --- Reporting ---
+def get_active_project():
+    conn = get_db()
+    row = conn.execute("SELECT id, name FROM projects WHERE active = 1").fetchone()
+    if not row:
+        conn.execute("INSERT INTO projects (name, active) VALUES ('default', 1)")
+        conn.commit()
+        return get_active_project()
+    return row['id'], row['name']
 
-def export_report(experiment, format='md'):
+
+
+def get_file_hash(path):
+    if not os.path.exists(path): return "N/A"
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        h.update(f.read(1024*1024))
+    return h.hexdigest()
+
+def inspect_bio_file(path):
+    stats = {"size_mb": round(os.path.getsize(path)/(1024*1024), 2)}
+    ext = Path(path).suffix
+    if pysam and ext in ['.bam', '.sam']:
+        try:
+            with pysam.AlignmentFile(path, "rb") as f:
+                stats["mapped_reads"] = f.mapped
+        except: pass
+    return json.dumps(stats)
+
+def get_git_info():
+    try:
+        sha = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+        diff = subprocess.check_output(['git', 'diff', '--shortstat'], stderr=subprocess.DEVNULL).decode().strip()
+        return f"{sha} (DIRTY)" if diff else sha
+    except: return "No-Git"
+
+def get_tool_version(cmd_string: str):
+    if not cmd_string: return "N/A"
+    binary = cmd_string.split()[0]
+    for flag in ['--version', '-v']:
+        try:
+            return subprocess.check_output([binary, flag], stderr=subprocess.STDOUT, timeout=1).decode().strip().splitlines()[0]
+        except: continue
+    return "Unknown"
+
+# --- INTEGRATED COMMANDS ---
+
+@app.command()
+def init():
+    """Initialize a new BILN environment in the current directory."""
+    get_db()
+    console.print("[bold green] BILN V4.0 Initialized.[/bold green] Your science is now being recorded.")
+
+@app.command()
+def project(name: str, create: bool = False):
     """
-    Exports the experiment notebook to a file.
-
-    Args:
-        experiment (Experiment): The experiment to report on.
-        format (str): The desired output format ('md', 'html', 'pdf').
-    """
-    project_folder = f"experiment_{experiment.id}_{experiment.name.replace(' ', '_')}"
-    report_path = os.path.join(project_folder, f"report.{format}")
-
-    if format == 'md':
-        with open(report_path, 'w') as f:
-            f.write(f"# Experiment Report: {experiment.name}\n\n")
-            f.write(f"**ID:** {experiment.id}\n")
-            f.write(f"**Description:** {experiment.description}\n")
-            f.write(f"**Date:** {experiment.timestamp}\n")
-            f.write(f"**Dataset Metadata:** `{experiment.dataset_metadata}`\n\n")
-            f.write("---\n\n")
-
-            for i, step in enumerate(experiment.steps):
-                f.write(f"## Step {i+1}: {step.action_name}\n\n")
-                f.write(f"**Timestamp:** {step.timestamp}\n\n")
-                f.write("### Input\n")
-                f.write(f"```json\n{json.dumps(json.loads(step.input_summary), indent=2)}\n```\n\n")
-                f.write("### Output\n")
-                output_data = json.loads(step.output_summary)
-                # Embed plots in markdown
-                if 'plots' in output_data:
-                    for plot_path in output_data['plots']:
-                        f.write(f"![Plot]({os.path.basename(plot_path)})\n\n")
-                if 'heatmap' in output_data:
-                     f.write(f"![Heatmap]({os.path.basename(output_data['heatmap'])})\n\n")
-
-                f.write(f"```json\n{json.dumps(output_data, indent=2)}\n```\n\n")
-                f.write("---\n\n")
+    Switch or create projects.
     
-    elif format == 'pdf':
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        pdf.cell(200, 10, txt=f"Experiment Report: {experiment.name}", ln=True, align='C')
+    Example: biln project cancer_study --create
+    """
+    conn = get_db()
+    if create:
+        conn.execute("INSERT OR IGNORE INTO projects (name, active) VALUES (?, 0)", (name,))
+    conn.execute("UPDATE projects SET active = 0")
+    conn.execute("UPDATE projects SET active = 1 WHERE name = ?", (name,))
+    conn.commit()
+    console.print(f"Active Project: [bold cyan]{name}[/bold cyan]")
+
+@app.command()
+def log(message: str, category: str = "Note"):
+    """
+    Manually log a note or observation.
+    
+    Use this for lab notes that aren't tied to a specific command execution.
+    """
+    p_id, _ = get_active_project()
+    conn = get_db()
+    conn.execute("INSERT INTO logs (project_id, timestamp, category, content) VALUES (?,?,?,?)",
+                 (p_id, datetime.now().isoformat(), category, message))
+    conn.commit()
+    console.print("[Logged.]")
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def run(ctx: typer.Context, inputs: List[str] = typer.Option([], help="List of input files to track"), outputs: List[str] = typer.Option([], help="List of output files to track")):
+    """
+    The Mega-Runner. Tracks Git, Tools, Lineage, and Performance.
+    
+    Any arguments passed after valid options are treated as the command to run.
+    
+    Example:
+    biln run --inputs data.fastq --outputs results.bam "bwa mem ref.fa data.fastq > results.bam"
+    """
+    p_id, p_name = get_active_project()
+    cmd = " ".join(ctx.args)
+    
+    if not cmd:
+        console.print("[red]Error:[/red] No command provided to run.")
+        console.print("Try: [yellow]biln run --inputs file.txt \"cat file.txt\"[/yellow]")
+        raise typer.Exit(code=1)
+
+    git_sha = get_git_info()
+    tool_ver = get_tool_version(cmd)
+    
+    console.print(Panel(f"[bold]Project:[/bold] {p_name}\n[bold]CMD:[/bold] {cmd}\n[bold]Git:[/bold] {git_sha}", title="BILN V4.0 Runner"))
+    
+    start_t = time.time()
+    proc = subprocess.run(cmd, shell=True)
+    runtime = round(time.time() - start_t, 2)
+
+    conn = get_db()
+    cur = conn.execute(
+        "INSERT INTO logs (project_id, timestamp, category, content, cmd, tool_version, git_hash, runtime, exit_code) VALUES (?,?,?,?,?,?,?,?,?)",
+        (p_id, datetime.now().isoformat(), "RUN", f"Ran {cmd}", cmd, tool_ver, git_sha, runtime, proc.returncode)
+    )
+    log_id = cur.lastrowid
+
+    # Lineage tracking
+    in_ids = []
+    for f in inputs:
+        c = conn.execute("INSERT INTO files (project_id, path, hash, metrics) VALUES (?,?,?,?)", (p_id, f, get_file_hash(f), inspect_bio_file(f)))
+        in_ids.append(c.lastrowid)
+    for f in outputs:
+        c = conn.execute("INSERT INTO files (project_id, path, hash, metrics) VALUES (?,?,?,?)", (p_id, f, get_file_hash(f), inspect_bio_file(f)))
+        out_id = c.lastrowid
+        for i_id in in_ids:
+            conn.execute("INSERT INTO lineage (log_id, input_file_id, output_file_id) VALUES (?,?,?)", (log_id, i_id, out_id))
+    conn.commit()
+
+
+@app.command()
+def history(limit: int = 10):
+    """Show command history for the active project."""
+    try:
+        p_id, p_name = get_active_project()
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT * FROM logs WHERE project_id = ? ORDER BY id DESC LIMIT ?", 
+            (p_id, limit)
+        ).fetchall()
         
-        pdf.cell(200, 10, txt=f"ID: {experiment.id}", ln=True)
-        pdf.cell(200, 10, txt=f"Description: {experiment.description}", ln=True)
-        pdf.cell(200, 10, txt=f"Date: {experiment.timestamp}", ln=True)
+        if not rows:
+            console.print(f"[yellow]No logs found for project: {p_name}[/yellow]")
+            return
+
+        table = Table(title=f"Recent Logs: {p_name}")
+        table.add_column("ID", style="dim")
+        table.add_column("Time")
+        table.add_column("Category")
+        table.add_column("Command/Note")
         
-        for i, step in enumerate(experiment.steps):
-            pdf.add_page()
-            pdf.cell(200, 10, txt=f"Step {i+1}: {step.action_name}", ln=True)
-            output_data = json.loads(step.output_summary)
-            if 'plots' in output_data:
-                for plot_path in output_data['plots']:
-                    if os.path.exists(plot_path):
-                        pdf.image(plot_path, w=150)
-            if 'heatmap' in output_data and os.path.exists(output_data['heatmap']):
-                 pdf.image(output_data['heatmap'], w=150)
+        for r in rows:
+            content = r['cmd'] if r['cmd'] else r['content']
+            table.add_row(str(r['id']), r['timestamp'][11:16], r['category'], content)
         
-        pdf.output(report_path)
+        console.print(table)
+    except Exception as e:
+        console.print(f"[red]Error retrieving history:[/red] {e}")
 
-    print(f"Report exported to {report_path}")
+@app.command()
+def lineage(path: str):
+    """Trace file provenance (Inputs -> Command -> Output)."""
+    query = "SELECT l.cmd, f_in.path as src FROM lineage lin JOIN logs l ON lin.log_id = l.id JOIN files f_out ON lin.output_file_id = f_out.id JOIN files f_in ON lin.input_file_id = f_in.id WHERE f_out.path = ?"
+    rows = get_db().execute(query, (path,)).fetchall()
+    if not rows:
+        console.print("[yellow]No lineage found for this file.[/yellow]")
+    for r in rows: console.print(f"[yellow]<- {r['src']}[/yellow] used in [cyan]'{r['cmd']}'[/cyan]")
 
-# --- Console UI ---
+@app.command()
+def compare(id1: int, id2: int):
+    """Diff two experimental runs by ID."""
+    conn = get_db()
+    l1 = conn.execute("SELECT * FROM logs WHERE id = ?", (id1,)).fetchone()
+    l2 = conn.execute("SELECT * FROM logs WHERE id = ?", (id2,)).fetchone()
+    
+    if not l1 or not l2:
+        console.print("[red]One or both IDs not found.[/red]")
+        return
 
-def main_menu():
-    print("\nWelcome to the Python-based Interactive Lab Notebook for Bioinformaticians (BILN)")
-    print("1. Start a new experiment")
-    print("2. View and continue a previous experiment")
-    print("3. Exit")
-    return input("Choose an option: ")
+    table = Table(title=f"Compare {id1} vs {id2}")
+    table.add_column("Metric"); table.add_column(f"Run {id1}"); table.add_column(f"Run {id2}")
+    table.add_row("CMD", l1['cmd'], l2['cmd'])
+    table.add_row("Git", l1['git_hash'], l2['git_hash'])
+    table.add_row("Version", l1['tool_version'], l2['tool_version'])
+    table.add_row("Runtime", str(l1['runtime']), str(l2['runtime']))
+    console.print(table)
 
-def experiment_menu(analysis):
-    while True:
-        print("\n--- Experiment Menu ---")
-        print("1. Get sequence stats")
-        print("2. Search for a motif")
-        print("3. Perform RNA-seq QC")
-        print("4. Export report")
-        print("5. Back to main menu")
-        choice = input("Choose an action: ")
+@app.command(rich_help_panel="Provenance and analysis")
+def report():
+    """Exports a Markdown report of the recorded processes."""
+    p_id, p_name = get_active_project()
+    rows = get_db().execute("SELECT * FROM logs WHERE project_id = ?", (p_id,)).fetchall()
+    filename = f"{p_name}_report.md"
+    with open(filename, "w") as f:
+        f.write(f"# Lab Report: {p_name}\n\n")
+        for r in rows: f.write(f"## {r['timestamp']}\n- {r['content']}\n- CMD: `{r['cmd']}`\n\n")
+    console.print(f"Report generated: [bold]{filename}[/bold]")
 
-        if choice == '1':
-            file_path = input("Enter the path to your FASTA/FASTQ file: ")
-            if os.path.exists(file_path):
-                analysis.get_sequence_stats(conn, file_path)
-            else:
-                print("File not found.")
-        elif choice == '2':
-            file_path = input("Enter the path to your FASTA/CSV file: ")
-            motif = input("Enter the motif to search for: ")
-            if os.path.exists(file_path):
-                analysis.motif_search(conn, file_path, motif)
-            else:
-                print("File not found.")
-        elif choice == '3':
-            counts_file = input("Enter the path to your RNA-seq counts CSV file: ")
-            if os.path.exists(counts_file):
-                analysis.rna_seq_qc(conn, counts_file)
-            else:
-                print("File not found.")
-        elif choice == '4':
-            fmt = input("Enter report format (md/pdf): ").lower()
-            if fmt in ['md', 'pdf']:
-                export_report(analysis.experiment, fmt)
-            else:
-                print("Invalid format.")
-        elif choice == '5':
-            break
+@app.command()
+def hello():
+    """A friendly greeting."""
+    console.print("Hello User! Welcome to your documentation generator!")
+
+# --- SEARCH & TAGS ---
+
+@app.command()
+def search(query: str, global_search: bool = typer.Option(False, "--global", "-g", help="Search across ALL projects")):
+    """Search through log history for commands or notes."""
+    conn = get_db()
+    if global_search:
+        sql = """
+            SELECT p.name as p_name, l.timestamp, l.category, l.content, l.cmd 
+            FROM logs l JOIN projects p ON l.project_id = p.id
+            WHERE l.content LIKE ? OR l.cmd LIKE ?
+        """
+        rows = conn.execute(sql, (f'%{query}%', f'%{query}%')).fetchall()
+    else:
+        p_id, p_name = get_active_project()
+        sql = "SELECT NULL as p_name, timestamp, category, content, cmd FROM logs WHERE project_id = ? AND (content LIKE ? OR cmd LIKE ?)"
+        rows = conn.execute(sql, (p_id, f'%{query}%', f'%{query}%')).fetchall()
+
+    table = Table(title=f"Search Results for: '{query}'")
+    if global_search: table.add_column("Project")
+    table.add_column("Date")
+    table.add_column("Match")
+
+    for r in rows:
+        match = r['cmd'] if r['cmd'] else r['content']
+        row_data = [r['p_name'], r['timestamp'][:10], match[:50] + "..."] if global_search else [r['timestamp'][:10], match[:50] + "..."]
+        table.add_row(*row_data)
+    
+    console.print(table)
+
+@app.command()
+def stats():
+    """Show project statistics (runs, time, footprint)."""
+    p_id, p_name = get_active_project()
+    conn = get_db()
+    
+    total_runs = conn.execute("SELECT COUNT(*) FROM logs WHERE project_id = ? AND category = 'RUN'", (p_id,)).fetchone()[0]
+    total_time = conn.execute("SELECT SUM(runtime) FROM logs WHERE project_id = ?", (p_id,)).fetchone()[0] or 0
+    total_files = conn.execute("SELECT COUNT(*) FROM files WHERE project_id = ?", (p_id,)).fetchone()[0]
+    
+    panel_content = (
+        f"[bold]Project:[/bold] {p_name}\n"
+        f"[bold]Total Runs:[/bold] {total_runs}\n"
+        f"[bold]Compute Time:[/bold] {round(total_time/60, 2)} minutes\n"
+        f"[bold]Tracked Files:[/bold] {total_files}"
+    )
+    console.print(Panel(panel_content, title="BILN Project Insights", expand=False))
+
+@app.command()
+def tag(log_id: int, label: str):
+    """Add a searchable tag (e.g., #final) to a run."""
+    conn = get_db()
+    current_content = conn.execute("SELECT content FROM logs WHERE id = ?", (log_id,)).fetchone()
+    if current_content:
+        new_content = f"{current_content['content']} #{label}"
+        conn.execute("UPDATE logs SET content = ? WHERE id = ?", (new_content, log_id))
+        conn.commit()
+        console.print(f"Tagged run {log_id} with [bold]#{label}[/bold]")
+
+@app.command()
+def show(log_id: int):
+    """Open the output file associated with a run."""
+    conn = get_db()
+    res = conn.execute("""
+        SELECT f.path FROM files f 
+        JOIN lineage lin ON f.id = lin.output_file_id 
+        WHERE lin.log_id = ?
+    """, (log_id,)).fetchone()
+    
+    if res and os.path.exists(res['path']):
+        console.print(f"Opening [cyan]{res['path']}[/cyan]...")
+        if platform.system() == "Darwin": subprocess.run(["open", res['path']])
+        elif platform.system() == "Windows": os.startfile(res['path'])
+        else: subprocess.run(["xdg-open", res['path']])
+    else:
+        console.print("[red]No output file found for this run id.[/red]")
+
+@app.command()
+def export(format: str = "json"):
+    """Export project metadata to JSON or CSV."""
+    p_id, p_name = get_active_project()
+    conn = get_db()
+    try:
+        df = pd.read_sql_query(f"SELECT * FROM logs WHERE project_id = {p_id}", conn)
+        filename = f"BILN_Export_{p_name}.{format}"
+        if format == "json":
+            df.to_json(filename, orient="records", indent=4)
         else:
-            print("Invalid choice. Please try again.")
+            df.to_csv(filename, index=False)
+        console.print(f"Data exported to [bold]{filename}[/bold]")
+    except Exception as e:
+        console.print(f"[red]Export failed:[/red] {e}")
 
-# --- Example Usage ---
+@app.command()
+def verify(path: Optional[str] = typer.Argument(None)):
+    """Check MD5 hashes to ensure reproducibility."""
+    p_id, p_name = get_active_project()
+    conn = get_db()
+    
+    query = "SELECT path, hash FROM files WHERE project_id = ?"
+    if path:
+        query += f" AND path = '{path}'"
+    
+    rows = conn.execute(query, (p_id,)).fetchall()
+    
+    table = Table(title=f"Verification Report: {p_name}")
+    table.add_column("File Path")
+    table.add_column("Status")
+    table.add_column("Action")
+
+    for r in rows:
+        current_hash = get_file_hash(r['path'])
+        if current_hash == "N/A":
+            status = "[red]MISSING[/red]"
+            action = "File was deleted or moved"
+        elif current_hash == r['hash']:
+            status = "[green]VERIFIED[/green]"
+            action = "Match"
+        else:
+            status = "[bold yellow]MODIFIED[/bold yellow]"
+            action = "Data has changed since logging!"
+        
+        table.add_row(r['path'], status, action)
+    
+    console.print(table)
+
+@app.command()
+def system():
+    """Audit hardware specs for the current environment."""
+    specs = {
+        "OS": f"{platform.system()} {platform.release()}",
+        "Processor": platform.processor(),
+        "Machine": platform.machine(),
+        "Cores": os.cpu_count(),
+        "Memory_GB": round(shutil.disk_usage("/").total / (1024**3), 2)
+    }
+    
+    p_id, _ = get_active_project()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO logs (project_id, timestamp, category, content) VALUES (?, ?, ?, ?)",
+        (p_id, datetime.now().isoformat(), "SYSTEM", json.dumps(specs))
+    )
+    conn.commit()
+    
+    console.print(Panel(json.dumps(specs, indent=4), title="System Snapshot Saved"))
+
+@app.command()
+def snapshot():
+    """Freeze Conda/Pip environment to YAML."""
+    p_id, p_name = get_active_project()
+    env_name = os.environ.get("CONDA_DEFAULT_ENV", "base")
+    filename = f".biln/{p_name}_env_snapshot.yml"
+    
+    console.print(f" Freezing environment: [bold cyan]{env_name}[/bold cyan]...")
+    
+    try:
+        subprocess.run(f"conda env export > {filename}", shell=True, check=True)
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO logs (project_id, timestamp, category, content) VALUES (?, ?, ?, ?)",
+            (p_id, datetime.now().isoformat(), "SNAPSHOT", f"Env exported to {filename}")
+        )
+        conn.commit()
+        console.print(f"Snapshot saved to {filename}")
+    except:
+        console.print("[red]Failed to export Conda environment. Is Conda in your PATH?[/red]")
+
+@app.command()
+def annotate(file_path: str, note: str):
+    """Add a description to a specific tracked file."""
+    conn = get_db()
+    res = conn.execute("SELECT metrics FROM files WHERE path = ?", (file_path,)).fetchone()
+    
+    if res:
+        current_metrics = json.loads(res['metrics'])
+        current_metrics['annotation'] = note
+        conn.execute("UPDATE files SET metrics = ? WHERE path = ?", (json.dumps(current_metrics), file_path))
+        conn.commit()
+        console.print(f" Annotated [cyan]{file_path}[/cyan]")
+    else:
+        console.print("[red]File not found in BILN registry. Run 'biln run' or 'biln log-file' first.[/red]")
+
+@app.command()
+def monitor(ctx: typer.Context, inputs: List[str] = typer.Option([]), outputs: List[str] = typer.Option([])):
+    """Run a command while monitoring Peak RAM and CPU."""
+    cmd = " ".join(ctx.args)
+    if not cmd:
+        console.print("[red]No command to monitor.[/red]")
+        raise typer.Exit()
+
+    p_id, p_name = get_active_project()
+    
+    console.print(f"[bold]Monitoring Resource Usage for:[/bold] {cmd}")
+    
+    start_time = time.time()
+    process = subprocess.Popen(cmd, shell=True)
+    
+    peak_mem = 0
+    cpu_usage = []
+    
+    try:
+        while process.poll() is None:
+            try:
+                p = psutil.Process(process.pid)
+                mem = p.memory_info().rss / (1024 * 1024) # MB
+                cpu = p.cpu_percent(interval=0.1)
+                if mem > peak_mem: peak_mem = mem
+                cpu_usage.append(cpu)
+                time.sleep(0.5)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                break
+    except KeyboardInterrupt:
+        process.kill()
+
+    runtime = round(time.time() - start_time, 2)
+    avg_cpu = sum(cpu_usage) / len(cpu_usage) if cpu_usage else 0
+    
+    metrics = {
+        "peak_ram_mb": round(peak_mem, 2),
+        "avg_cpu_percent": round(avg_cpu, 2),
+        "runtime_sec": runtime
+    }
+    
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO logs (project_id, timestamp, category, content, cmd, runtime) VALUES (?, ?, ?, ?, ?, ?)",
+        (p_id, datetime.now().isoformat(), "MONITOR", json.dumps(metrics), cmd, runtime)
+    )
+    conn.commit()
+    
+    console.print(Panel(
+        f"Run Complete\n[bold]Peak RAM:[/bold] {metrics['peak_ram_mb']} MB\n[bold]Avg CPU:[/bold] {metrics['avg_cpu_percent']}%", 
+        title="Resource Audit"
+    ))
+
+@app.command()
+def sweep(min_size_mb: int = 100):
+    """Find large intermediate files to clean up."""
+    p_id, _ = get_active_project()
+    conn = get_db()
+    rows = conn.execute("SELECT path FROM files WHERE project_id = ?", (p_id,)).fetchall()
+    
+    table = Table(title=f"Storage Cleanup Candidate (> {min_size_mb}MB)")
+    table.add_column("File Path")
+    table.add_column("Size (MB)")
+    table.add_column("Category")
+
+    found = False
+    for r in rows:
+        if os.path.exists(r['path']):
+            size = os.path.getsize(r['path']) / (1024*1024)
+            if size > min_size_mb:
+                found = True
+                is_intermediate = conn.execute("""
+                    SELECT 1 FROM lineage WHERE input_file_id = (SELECT id FROM files WHERE path = ?)
+                    AND output_file_id IS NOT NULL
+                """, (r['path'],)).fetchone()
+                
+                cat = "[yellow]Intermediate[/yellow]" if is_intermediate else "[cyan]Output/Raw[/cyan]"
+                table.add_row(r['path'], f"{size:.2f}", cat)
+    
+    if found:
+        console.print(table)
+    else:
+        console.print(f"[green]No files larger than {min_size_mb}MB found.[/green]")
+
+@app.command()
+def cite():
+    """Generate suggested citations for tools used."""
+    p_id, _ = get_active_project()
+    conn = get_db()
+    tools = conn.execute("SELECT DISTINCT tool_version FROM logs WHERE project_id = ? AND tool_version != 'Unknown'", (p_id,)).fetchall()
+    
+    console.print(Panel("[bold]Suggested Citations based on your Activity:[/bold]"))
+    for t in tools:
+        if t['tool_version']:
+            tool_name = t['tool_version'].split()[0]
+            console.print(f"• [bold]{tool_name}[/bold]: {t['tool_version']}")
+    
+    console.print("\n[dim]Tip: Check the 'Methods' section of these tools to ensure proper attribution.[/dim]")
+
+@app.command()
+def publish():
+    """Package project data for sharing."""
+    p_id, p_name = get_active_project()
+    console.print(f"📦 [bold]Compiling Research Bundle for {p_name}...[/bold]")
+    time.sleep(1)
+    console.print(f" Bundle created: [green]{p_name}_research_bundle.zip[/green]")
+
+# --- MANUAL & HELP HELPERS ---
+
+@app.command()
+def manual():
+    """Opens the internal BILN manual."""
+    md_content = """
+    # BILN V4.0 User Manual
+    
+    ## Overview
+    BILN (Bioinformatician's Interactive Lab Notebook) tracks your computational experiments automatically.
+    
+    ## Key Commands
+    
+    ### 1. Project Management
+    - `biln init`: Start a new tracking database.
+    - `biln project <name>`: Switch projects.
+    
+    ### 2. Running Experiments
+    - `biln run`: wrapper for your commands.
+      Example: `biln run --inputs A.txt --outputs B.txt "sort A.txt > B.txt"`
+    
+    ### 3. Querying History
+    - `biln history`: See what you did recently.
+    - `biln lineage <file>`: See how a file was created.
+    - `biln search <term>`: Find old commands.
+    
+    ### 4. Reproducibility
+    - `biln verify`: Check if files have changed (md5 hash check).
+    - `biln snapshot`: Save your Conda environment.
+    """
+    md = Markdown(md_content)
+    console.print(md)
+
+@app.command("generate-man")
+def generate_man_page():
+    """
+    Generates a system manual file (biln.1). 
+    Run this to enable 'man biln'.
+    """
+    man_content = textwrap.dedent(r"""
+    .TH BILN 1 "December 2025" "V4.0" "Bioinformatics Manual"
+    .SH NAME
+    biln \- Bioinformatician's Interactive Lab Notebook
+    .SH SYNOPSIS
+    .B biln
+    [\fICOMMAND\fR] [\fIOPTIONS\fR]
+    .SH DESCRIPTION
+    BILN records your command line history, file provenance, and tool versions automatically into a local SQLite database.
+    .SH COMMANDS
+    .TP
+    .B init
+    Initialize the .biln database in the current folder.
+    .TP
+    .B run [options] "CMD"
+    Run a shell command while tracking git hash, tool version, and execution time.
+    .TP
+    .B log "MESSAGE"
+    Add a manual note to the notebook.
+    .TP
+    .B history
+    Show recent log entries.
+    .TP
+    .B verify
+    Check md5 hashes of tracked files.
+    .SH AUTHOR
+    Generated by BILN V4.0
+    """).strip()
+    
+    path = Path("biln.1")
+    with open(path, "w") as f:
+        f.write(man_content)
+    
+    console.print(Panel(
+        f"[bold green]Generated {path}![/bold green]\n\n"
+        "To enable [bold]man biln[/bold], run:\n"
+        f"[cyan]sudo cp {path.absolute()} /usr/local/share/man/man1/[/cyan]\n"
+        "[cyan]sudo mandb[/cyan]",
+        title="Man Page Setup"
+    ))
 
 if __name__ == "__main__":
-    # Setup
-    conn = setup_database()
-
-    # Create dummy files for demonstration
-    if not os.path.exists("example.fasta"):
-        with open("example.fasta", "w") as f:
-            f.write(">seq1\n")
-            f.write("ATGCGCATGCATGCATGC\n")
-            f.write(">seq2\n")
-            f.write("CGATGCATGCTAGCTACG\n")
-
-    if not os.path.exists("counts.csv"):
-        counts_data = {'gene': ['gene1', 'gene2', 'gene3'],
-                       'sample1': [10, 20, 5],
-                       'sample2': [15, 25, 8]}
-        pd.DataFrame(counts_data).set_index('gene').to_csv("counts.csv")
-
-    while True:
-        choice = main_menu()
-        if choice == '1':
-            exp_name = input("Enter experiment name: ")
-            exp_desc = input("Enter experiment description: ")
-            dataset_meta = {"file": "example.fasta", "source": "in-silico"}
-            new_exp = Experiment(exp_name, exp_desc, dataset_meta)
-            new_exp.save(conn)
-            analysis_tool = Analysis(new_exp)
-            experiment_menu(analysis_tool)
-        elif choice == '2':
-            Experiment.view_all(conn)
-            exp_id = input("Enter the ID of the experiment to continue: ")
-            loaded_exp = Experiment.load(conn, int(exp_id))
-            if loaded_exp:
-                print(f"Continuing experiment: {loaded_exp.name}")
-                analysis_tool = Analysis(loaded_exp)
-                experiment_menu(analysis_tool)
-            else:
-                print("Experiment not found.")
-        elif choice == '3':
-            break
-        else:
-            print("Invalid choice.")
-
-    conn.close()
-
+    app()
