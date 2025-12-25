@@ -39,9 +39,6 @@
 
 4.  **Add to your path (Optional but Recommended):**
     Add this alias to your `~/.bashrc` or `~/.zshrc` so you can just type `biln`:
-    ```bash
-    alias biln="BILN.py"
-    ```
 
 ##  Usage Guide
 
