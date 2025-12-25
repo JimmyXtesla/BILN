@@ -1,6 +1,6 @@
 # BILN: Bioinformatician's Interactive Lab Notebook
 
-**BILN (V4.0)** is a lightweight, "black box" flight recorder for your bioinformatics experiments. It wraps your terminal commands to automatically track **data lineage**, **software versions**, **Git hashes**, and **system resource usage** without getting in your way.
+**BILN (V1.0)** is a lightweight, "black box" flight recorder for your bioinformatics experiments. It wraps your terminal commands to automatically track **data lineage**, **software versions**, **Git hashes**, and **system resource usage** without getting in your way.
 
 > Stop asking *"Which parameter did I use for that BAM file three months ago?"* Let BILN remember for you.
 
