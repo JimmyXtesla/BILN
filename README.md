@@ -65,7 +65,6 @@ See what you did today, yesterday, or last month.
 Bash
 ```
 biln history
-
 ```
 4. Trace Data Lineage
 Forgot how final_results.vcf was created?
