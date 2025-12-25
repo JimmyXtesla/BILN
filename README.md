@@ -78,8 +78,10 @@ Bash
 biln lineage final_results.vcf
 ```
 # Output:
+```
  -> intermediate.bam used in 'samtools mpileup...'
  -> raw_reads.fastq used in 'bwa mem...'
+```
 
 5. Check System Resources
 Run a command and audit how much RAM it consumes.
