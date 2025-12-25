@@ -6,12 +6,12 @@
 
 ##  Key Features
 
-*   ** Automatic Provenance:** Tracks inputs, outputs, and the exact command used to create them.
-*   ** Resource Monitoring:** Records Runtime, Peak RAM, and CPU usage for every command.
-*   ** Reproducibility:** Captures the Git commit hash and tool versions (e.g., `samtools --version`) automatically.
-*   ** Lineage Tracing:** Query a file to see exactly how it was generated.
-*   ** Verification:** Checks MD5 hashes to ensure your data hasn't suffered bit-rot.
-*   ** Reporting:** Exports data to Pandas/JSON or generates Markdown lab reports.
+*   **Automatic Provenance:** Tracks inputs, outputs, and the exact command used to create them.
+*   **Resource Monitoring:** Records Runtime, Peak RAM, and CPU usage for every command.
+*   **Reproducibility:** Captures the Git commit hash and tool versions (e.g., `samtools --version`) automatically.
+*   **Lineage Tracing:** Query a file to see exactly how it was generated.
+*   **Verification:** Checks MD5 hashes to ensure your data hasn't suffered bit-rot.
+*   **Reporting:** Exports data to Pandas/JSON or generates Markdown lab reports.
 
 ## Installation
 
