@@ -91,10 +91,10 @@ Advanced Commands
 
 Command	Description
 ```
-biln verify	Checks if files on disk match their recorded MD5 hashes.
-biln snapshot	Exports your current Conda/Pip environment to YAML.
-biln compare <ID1> <ID2>	Diff two different runs to see changed parameters.
-biln report	Generates a markdown lab notebook summary.
-biln manual	Opens the built-in interactive manual.
+biln verify	             Checks if files on disk match their recorded MD5 hashes.
+biln snapshot	         Exports your current Conda/Pip environment to YAML.
+biln compare <ID1> <ID2> Diff two different runs to see changed parameters.
+biln report	             Generates a markdown lab notebook summary.
+biln manual	             Opens the built-in interactive manual.
 ```
 
