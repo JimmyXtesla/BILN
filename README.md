@@ -50,3 +50,52 @@ Start tracking in your current directory. This creates a hidden `.biln` database
 ```bash
 biln init
 biln project my_cancer_study --create
+```
+2. Run Experiments
+Instead of running commands directly, wrap them with biln run.
+--inputs: Files read by the command.
+--outputs: Files created by the command.
+
+Bash
+```
+# Example: Mapping reads
+biln run --inputs data/sample1.fastq --outputs aligned/sample1.bam \
+    "bwa mem ref.fa data/sample1.fastq | samtools sort > aligned/sample1.bam"
+```
+3. Review History
+See what you did today, yesterday, or last month.
+
+Bash
+```
+biln history
+
+```
+4. Trace Data Lineage
+Forgot how final_results.vcf was created?
+
+Bash
+```
+biln lineage final_results.vcf
+```
+# Output:
+# <- intermediate.bam used in 'samtools mpileup...'
+# <- raw_reads.fastq used in 'bwa mem...'
+
+5. Check System Resources
+Run a command and audit how much RAM it consumes.
+
+Bash
+```
+biln monitor "spades.py -1 R1.fq -2 R2.fq -o assembly_out"
+```
+Advanced Commands
+
+Command	Description
+```
+biln verify	Checks if files on disk match their recorded MD5 hashes.
+biln snapshot	Exports your current Conda/Pip environment to YAML.
+biln compare <ID1> <ID2>	Diff two different runs to see changed parameters.
+biln report	Generates a markdown lab notebook summary.
+biln manual	Opens the built-in interactive manual.
+```
+
