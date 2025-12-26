@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
 # BILN - Python-based Interactive Lab Notebook for Bioinformaticians
 #Author: Jimmy X Banda.
-#!/usr/bin/env python3
+
 import psutil
 import os
 import platform
@@ -25,7 +26,7 @@ from rich.syntax import Syntax
 
 
 app = typer.Typer(
-    help="BILN V4.0: The Complete Bioinformatician's Interactive Lab Notebook.\n\nTrack your science, provenance, and system metrics automatically.",
+    help="BILN V1.0: The Complete Bioinformatician's Interactive Lab Notebook.\n\nTrack your science, provenance, and system metrics automatically.",
     add_completion=False 
 )
 console = Console()
@@ -586,7 +587,7 @@ def generate_man_page():
     Run this to enable 'man biln'.
     """
     man_content = textwrap.dedent(r"""
-    .TH BILN 1 "December 2025" "V4.0" "Bioinformatics Manual"
+    .TH BILN 1 "December 2025" "V1.0" "Bioinformatics Manual"
     .SH NAME
     biln \- Bioinformatician's Interactive Lab Notebook
     .SH SYNOPSIS
