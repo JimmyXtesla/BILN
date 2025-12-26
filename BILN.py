@@ -553,7 +553,7 @@ def publish():
 def manual():
     """Opens the internal BILN manual."""
     md_content = """
-    # BILN V4.0 User Manual
+    # BILN V1.0 User Manual
     
     ## Overview
     BILN (Bioinformatician's Interactive Lab Notebook) tracks your computational experiments automatically.
