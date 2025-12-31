@@ -65,7 +65,7 @@ def get_db():
         )
     """)
     
-    # Files (Tracked Data) - Added 'archived' column
+    # Files (Tracked Data) 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY, project_id INTEGER, path TEXT, 
