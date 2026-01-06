@@ -101,7 +101,6 @@ def get_file_hash(path):
     h = hashlib.md5()
     try:
         with open(path, "rb") as f:
-            # Only hash the first 10MB for speed in interactive usage
             h.update(f.read(10 * 1024 * 1024)) 
         return h.hexdigest()
     except: return "Error"
