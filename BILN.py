@@ -155,7 +155,7 @@ def project(name: str, create: bool = False):
 @app.command()
 def hello():
     """A friendly greeting."""
-    console.print("Hello User! Welcome to BILN V1.0!")
+    console.print("Hello User! Welcome to BILN V1.0. Enjoy")
 
 # --- EXECUTION & LOGGING ---
 
