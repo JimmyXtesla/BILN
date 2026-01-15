@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # BILN - Python-based Interactive Lab Notebook for Bioinformaticians
 # Author: Jimmy X Banda.
-# Version: 1.0 (2025)
+# Version: 1.0 (2025) - Updated File Tracking
 
 import psutil
 import os
@@ -65,11 +65,12 @@ def get_db():
         )
     """)
     
-    # Files (Tracked Data) 
+    # Files (Tracked Data) - Added UNIQUE constraint to prevent duplicates
     conn.execute("""
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY, project_id INTEGER, path TEXT, 
-            hash TEXT, metrics TEXT, archived INTEGER DEFAULT 0
+            hash TEXT, metrics TEXT, archived INTEGER DEFAULT 0,
+            UNIQUE(project_id, path)
         )
     """)
     
@@ -97,13 +98,31 @@ def get_active_project():
     return row['id'], row['name']
 
 def get_file_hash(path):
-    if not os.path.exists(path): return "N/A"
+    p = Path(path)
+    if not p.exists(): return "N/A"
     h = hashlib.md5()
     try:
-        with open(path, "rb") as f:
+        with open(p, "rb") as f:
             h.update(f.read(10 * 1024 * 1024)) 
         return h.hexdigest()
     except: return "Error"
+
+def track_file(conn, project_id, path):
+    """Helper to ensure files are tracked using absolute paths without duplication."""
+    abs_path = str(Path(path).resolve())
+    f_hash = get_file_hash(abs_path)
+    metrics = inspect_bio_file(abs_path)
+    
+    # UPSERT logic: Insert new file record or update existing one if path matches
+    conn.execute("""
+        INSERT INTO files (project_id, path, hash, metrics) VALUES (?, ?, ?, ?)
+        ON CONFLICT(project_id, path) DO UPDATE SET 
+            hash=excluded.hash, 
+            metrics=excluded.metrics
+    """, (project_id, abs_path, f_hash, metrics))
+    
+    res = conn.execute("SELECT id FROM files WHERE project_id = ? AND path = ?", (project_id, abs_path)).fetchone()
+    return res['id']
 
 def inspect_bio_file(path):
     if not os.path.exists(path): return json.dumps({"error": "File missing"})
@@ -128,7 +147,6 @@ def get_tool_version(cmd_string: str):
     binary = cmd_string.split()[0]
     for flag in ['--version', '-v', '-V']:
         try:
-            # Timeout to prevent hanging on interactive shells
             return subprocess.check_output([binary, flag], stderr=subprocess.STDOUT, timeout=1).decode().strip().splitlines()[0]
         except: continue
     return "Unknown"
@@ -182,10 +200,16 @@ def run(ctx: typer.Context, inputs: List[str] = typer.Option([], help="Input fil
         console.print("[red]Error:[/red] No command provided.")
         raise typer.Exit(code=1)
 
+    conn = get_db()
+    
+    # 1. Track Inputs BEFORE execution
+    in_ids = []
+    for f in inputs:
+        in_ids.append(track_file(conn, p_id, f))
+
     git_sha = get_git_info()
     tool_ver = get_tool_version(cmd)
     
-    # Environment Context
     env_info = {
         "host": platform.node(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID", None),
@@ -205,23 +229,20 @@ def run(ctx: typer.Context, inputs: List[str] = typer.Option([], help="Input fil
 
     runtime = round(time.time() - start_t, 2)
 
-    conn = get_db()
+    # 2. Log the execution
     cur = conn.execute(
         "INSERT INTO logs (project_id, timestamp, category, content, cmd, tool_version, git_hash, runtime, env_info, exit_code) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (p_id, datetime.now().isoformat(), "RUN", f"Ran {cmd}", cmd, tool_ver, git_sha, runtime, json.dumps(env_info), exit_code)
     )
     log_id = cur.lastrowid
 
-    # Lineage tracking
-    in_ids = []
-    for f in inputs:
-        c = conn.execute("INSERT INTO files (project_id, path, hash, metrics) VALUES (?,?,?,?)", (p_id, f, get_file_hash(f), inspect_bio_file(f)))
-        in_ids.append(c.lastrowid)
+    # 3. Track Outputs AFTER execution and link Lineage
     for f in outputs:
-        c = conn.execute("INSERT INTO files (project_id, path, hash, metrics) VALUES (?,?,?,?)", (p_id, f, get_file_hash(f), inspect_bio_file(f)))
-        out_id = c.lastrowid
-        for i_id in in_ids:
-            conn.execute("INSERT INTO lineage (log_id, input_file_id, output_file_id) VALUES (?,?,?)", (log_id, i_id, out_id))
+        if os.path.exists(f):
+            out_id = track_file(conn, p_id, f)
+            for i_id in in_ids:
+                conn.execute("INSERT INTO lineage (log_id, input_file_id, output_file_id) VALUES (?,?,?)", (log_id, i_id, out_id))
+    
     conn.commit()
 
 @app.command()
@@ -311,7 +332,14 @@ def search(query: str):
 @app.command()
 def lineage(path: str):
     """Trace file inputs and outputs."""
-    rows = get_db().execute("SELECT l.cmd, f_in.path as src, l.id as run_id FROM lineage lin JOIN logs l ON lin.log_id = l.id JOIN files f_in ON lin.input_file_id = f_in.id JOIN files f_out ON lin.output_file_id = f_out.id WHERE f_out.path = ?", (path,)).fetchall()
+    abs_path = str(Path(path).resolve())
+    rows = get_db().execute("""
+        SELECT l.cmd, f_in.path as src, l.id as run_id 
+        FROM lineage lin 
+        JOIN logs l ON lin.log_id = l.id 
+        JOIN files f_in ON lin.input_file_id = f_in.id 
+        JOIN files f_out ON lin.output_file_id = f_out.id 
+        WHERE f_out.path = ?""", (abs_path,)).fetchall()
     if not rows: console.print("[yellow]No lineage found.[/yellow]")
     for r in rows: console.print(f"[yellow]<- {r['src']}[/yellow] used in [cyan]run {r['run_id']}[/cyan]")
 
@@ -412,16 +440,58 @@ def dashboard():
     with open(f"{p_name}_dashboard.html", "w") as f: f.write(out)
     console.print(f"[green]Dashboard saved: {p_name}_dashboard.html[/green]")
 
+
 @app.command()
 def viz(output: str = "workflow.dot"):
-    """Generate Graphviz DOT file of lineage."""
-    p_id, _ = get_active_project()
-    links = get_db().execute("SELECT f_in.path as src, f_out.path as dest, l.cmd FROM lineage l JOIN logs log ON l.log_id = log.id JOIN files f_in ON l.input_file_id = f_in.id JOIN files f_out ON l.output_file_id = f_out.id WHERE log.project_id = ?", (p_id,)).fetchall()
+    """
+    Generate a Graphviz DOT file of the project lineage.
+    To view: Install graphviz and run 'dot -Tpng workflow.dot -o workflow.png'
+    """
+    p_id, p_name = get_active_project()
+    conn = get_db()
+    
+    # Query to link inputs and outputs via the lineage table
+    query = """
+        SELECT 
+            f_in.path as src, 
+            f_out.path as dest, 
+            log.cmd 
+        FROM lineage lin
+        JOIN logs log ON lin.log_id = log.id
+        JOIN files f_in ON lin.input_file_id = f_in.id
+        JOIN files f_out ON lin.output_file_id = f_out.id
+        WHERE log.project_id = ?
+    """
+    links = conn.execute(query, (p_id,)).fetchall()
+    
+    if not links:
+        console.print("[yellow]No lineage links found to visualize.[/yellow]")
+        return
+
     with open(output, "w") as f:
-        f.write('digraph G { rankdir="LR"; node [shape=box style=filled fillcolor="#E8F0FE"];\n')
-        for l in links: f.write(f'  "{os.path.basename(l["src"])}" -> "{os.path.basename(l["dest"])}" [label="{l["cmd"].split()[0]}"];\n')
+        f.write(f'digraph "{p_name}" {{\n')
+        f.write('    rankdir="LR";\n')
+        f.write('    node [shape=box, style="filled, rounded", fillcolor="#E8F0FE", fontname="Arial"];\n')
+        f.write('    edge [fontname="Verdana", fontsize=10];\n\n')
+        
+        for l in links:
+            # We use the filename (basename) for the nodes to keep the graph clean
+            src_node = os.path.basename(l["src"])
+            dest_node = os.path.basename(l["dest"])
+            # Get the first word of the command (the tool name) as the label
+            tool_name = l["cmd"].split()[0] if l["cmd"] else "unknown"
+            
+            f.write(f'    "{src_node}" -> "{dest_node}" [label=" {tool_name} "];\n')
+        
         f.write("}\n")
-    console.print(f"[green]Graph saved to {output}[/green]")
+    
+    console.print(Panel(
+        f"[green]Graphviz file saved to:[/green] [bold]{output}[/bold]\n\n"
+        "To convert to an image, use:\n"
+        f"[cyan]dot -Tpng {output} -o workflow.png[/cyan]\n"
+        "Or paste the content into [bold][link=https://dreampuf.github.io/GraphvizOnline/]Graphviz Online[/link][/bold]",
+        title="Lineage Visualization"
+    ))
 
 @app.command()
 def methods():
@@ -519,14 +589,70 @@ def snapshot():
     console.print(f"[green]Env saved to {fname}[/green]")
 
 @app.command()
-def export(format: str = "csv"):
-    """Export DB to CSV/JSON."""
-    p_id, name = get_active_project()
-    df = pd.read_sql_query(f"SELECT * FROM logs WHERE project_id = {p_id}", get_db())
-    fname = f"BILN_{name}.{format}"
-    if format == "json": df.to_json(fname)
-    else: df.to_csv(fname)
-    console.print(f"Exported: {fname}")
+def export(output: str = "PROVENANCE.md"):
+    """
+    Generate a full Markdown documentation of the project's history and provenance.
+    """
+    p_id, p_name = get_active_project()
+    conn = get_db()
+    
+    # 1. Fetch Project Info
+    logs = conn.execute("SELECT * FROM logs WHERE project_id = ? ORDER BY timestamp ASC", (p_id,)).fetchall()
+    
+    with open(output, "w") as f:
+        # Header
+        f.write(f"# Project Documentation: {p_name}\n")
+        f.write(f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("## Summary\n")
+        f.write(f"- **Total Events:** {len(logs)}\n")
+        f.write(f"- **Active Environment:** {os.environ.get('CONDA_DEFAULT_ENV', 'N/A')}\n\n")
+        
+        f.write("--- \n\n")
+        f.write("## Process Log\n\n")
+        
+        for entry in logs:
+            f.write(f"### {entry['timestamp'][:16]} | {entry['category']}\n")
+            
+            if entry['category'] == "RUN":
+                # Detail the command execution
+                f.write(f"**Command:**\n```bash\n{entry['cmd']}\n```\n")
+                f.write(f"- **Tool Version:** `{entry['tool_version']}`\n")
+                f.write(f"- **Git Hash:** `{entry['git_hash']}`\n")
+                f.write(f"- **Runtime:** {entry['runtime']}s\n")
+                f.write(f"- **Exit Code:** `{entry['exit_code']}`\n")
+                
+                # Retrieve Inputs and Outputs for this specific RUN
+                lineage_data = conn.execute("""
+                    SELECT 
+                        (SELECT path FROM files WHERE id = lin.input_file_id) as input_path,
+                        (SELECT path FROM files WHERE id = lin.output_file_id) as output_path
+                    FROM lineage lin WHERE log_id = ?
+                """, (entry['id'],)).fetchall()
+                
+                if lineage_data:
+                    inputs = sorted(list(set([os.path.basename(r['input_path']) for r in lineage_data if r['input_path']])))
+                    outputs = sorted(list(set([os.path.basename(r['output_path']) for r in lineage_data if r['output_path']])))
+                    
+                    if inputs: f.write(f"- **Inputs:** {', '.join([f'`{i}`' for i in inputs])}\n")
+                    if outputs: f.write(f"- **Outputs:** {', '.join([f'`{o}`' for o in outputs])}\n")
+                
+            elif entry['category'] == "Note":
+                f.write(f"> **Observation:** {entry['content']}\n")
+
+            elif entry['category'] == "ANNOTATION":
+                f.write(f"#### 📝 File Annotation\n")
+                f.write(f"{entry['content']}\n")
+            
+            elif entry['category'] == "MONITOR":
+                metrics = json.loads(entry['content'])
+                f.write(f"**Resource Usage:**\n")
+                f.write(f"- Peak RAM: {metrics['peak_ram_mb']} MB\n")
+                f.write(f"- Avg CPU: {metrics['avg_cpu']}%\n")
+                
+            f.write("\n---\n\n")
+
+    console.print(Panel(f"[green]Documentation successfully exported to:[/green] [bold]{output}[/bold]", title="Export Complete"))
 
 @app.command()
 def cite():
@@ -535,9 +661,47 @@ def cite():
 
 @app.command()
 def annotate(path: str, note: str):
-    """Add note to file."""
-    console.print(f"Annotated {path} with: {note}")
+    """
+    Add a persistent note/annotation to a specific tracked file.
+    Example: biln annotate results.vcf "High quality variants, filtered with depth > 20"
+    """
+    p_id, _ = get_active_project()
+    conn = get_db()
+    
+    # Resolve to absolute path to match the database
+    abs_path = str(Path(path).resolve())
 
+    # 1. Check if the file is already tracked
+    file_row = conn.execute(
+        "SELECT id FROM files WHERE project_id = ? AND path = ?", 
+        (p_id, abs_path)
+    ).fetchone()
+
+    if not file_row:
+        # If the file isn't tracked yet, track it now so the annotation has a target
+        if os.path.exists(abs_path):
+            console.print(f"[dim]File not previously tracked. Adding {path} to project...[/dim]")
+            track_file(conn, p_id, abs_path)
+        else:
+            console.print(f"[red]Error:[/red] File '{path}' does not exist on disk.")
+            return
+
+    # 2. Log the annotation as a special category
+    # We store the filename in the content so it's searchable
+    timestamp = datetime.now().isoformat()
+    display_name = os.path.basename(abs_path)
+    
+    conn.execute(
+        "INSERT INTO logs (project_id, timestamp, category, content) VALUES (?, ?, ?, ?)",
+        (p_id, timestamp, "ANNOTATION", f"[{display_name}] {note}")
+    )
+    conn.commit()
+
+    console.print(Panel(
+        f"[bold cyan]File:[/bold cyan] {display_name}\n[bold cyan]Note:[/bold cyan] {note}", 
+        title="Annotation Saved"
+    ))
+    
 @app.command()
 def system():
     """Log system hardware."""
