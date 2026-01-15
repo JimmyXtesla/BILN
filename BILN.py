@@ -411,35 +411,222 @@ def export_snakemake(filename: str = "Snakefile"):
     console.print(f"[green]Pipeline exported to {filename}[/green]")
 
 @app.command()
-def dashboard():
-    """Generate an interactive HTML dashboard."""
+def dashboard(output: str = None):
+    """
+    Generate a high-end interactive HTML dashboard with project metrics and lineage.
+    """
     if Template is None:
-        console.print("[red]Error: 'jinja2' not installed.[/red]")
+        console.print("[red]Error: 'jinja2' not installed. Run 'pip install jinja2'[/red]")
         return
 
     p_id, p_name = get_active_project()
     conn = get_db()
-    logs = conn.execute("SELECT * FROM logs WHERE project_id = ? ORDER BY id DESC", (p_id,)).fetchall()
-    file_count = conn.execute("SELECT COUNT(*) FROM files WHERE project_id = ?", (p_id,)).fetchone()[0]
     
-    html = """
-    <!DOCTYPE html><html><head><title>BILN: {{p}}</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    </head><body class="bg-light p-4"><div class="container">
-    <h1> BILN Project: {{p}}</h1>
-    <div class="row my-4"><div class="col"><div class="card p-3 bg-primary text-white"><h3>{{n_runs}}</h3>Runs</div></div>
-    <div class="col"><div class="card p-3 bg-success text-white"><h3>{{n_files}}</h3>Files</div></div></div>
-    <div class="card p-3"><table class="table"><thead><tr><th>ID</th><th>Time</th><th>CMD</th></tr></thead><tbody>
-    {% for l in logs %}<tr><td>{{l.id}}</td><td>{{l.timestamp[:16]}}</td><td><code>{{l.cmd or l.content}}</code></td></tr>{% endfor %}
-    </tbody></table></div></div></body></html>
-    """
-    
-    t = Template(html)
-    out = t.render(p=p_name, logs=logs, n_runs=len([l for l in logs if l['category']=='RUN']), n_files=file_count)
-    
-    with open(f"{p_name}_dashboard.html", "w") as f: f.write(out)
-    console.print(f"[green]Dashboard saved: {p_name}_dashboard.html[/green]")
+    if output is None:
+        output = f"{p_name}_dashboard.html"
 
+    # --- DATA GATHERING ---
+    logs = conn.execute("SELECT * FROM logs WHERE project_id = ? ORDER BY timestamp DESC", (p_id,)).fetchall()
+    files = conn.execute("SELECT * FROM files WHERE project_id = ?", (p_id,)).fetchall()
+    
+    # Metrics
+    n_runs = len([l for l in logs if l['category'] == 'RUN'])
+    n_files = len(files)
+    total_runtime = sum([l['runtime'] for l in logs if l['runtime']])
+    
+    success_count = len([l for l in logs if l['category'] == 'RUN' and l['exit_code'] == 0])
+    fail_count = n_runs - success_count
+    success_rate = round((success_count / n_runs * 100), 1) if n_runs > 0 else 0
+
+    # Data for Charts (Runtime Trend)
+    runtime_data = [{"time": l['timestamp'][11:16], "val": l['runtime'], "cmd": l['cmd'][:30]} 
+                    for l in reversed(logs) if l['category'] == 'RUN' and l['runtime']][-20:]
+
+    # Lineage for Mermaid Chart
+    links = conn.execute("""
+        SELECT f_in.path as src, f_out.path as dest, log.cmd 
+        FROM lineage lin
+        JOIN logs log ON lin.log_id = log.id
+        JOIN files f_in ON lin.input_file_id = f_in.id
+        JOIN files f_out ON lin.output_file_id = f_out.id
+        WHERE log.project_id = ? LIMIT 50
+    """, (p_id,)).fetchall()
+
+    mermaid_code = "graph LR\n"
+    for l in links:
+        s = os.path.basename(l['src'])
+        d = os.path.basename(l['dest'])
+        tool = l['cmd'].split()[0] if l['cmd'] else "step"
+        mermaid_code += f'    {s} -->|"{tool}"| {d}\n'
+
+    # --- HTML TEMPLATE ---
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>BILN Dashboard: {{p_name}}</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
+        <script src="https://cdn.plot.ly/plotly-2.16.1.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+        <style>
+            body { background-color: #f8f9fa; font-family: 'Inter', sans-serif; }
+            .card { border: none; box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.075); margin-bottom: 20px; }
+            .stat-card { background: linear-gradient(45deg, #4e73df 10%, #224abe 90%); color: white; }
+            .mermaid { background: white; padding: 20px; border-radius: 10px; }
+            pre { background: #f1f1f1; padding: 10px; border-radius: 5px; font-size: 0.85em; }
+        </style>
+    </head>
+    <body>
+        <nav class="navbar navbar-dark bg-dark mb-4">
+            <div class="container-fluid">
+                <span class="navbar-brand mb-0 h1">BILN Interactive Report</span>
+                <span class="badge bg-primary">Project: {{p_name}}</span>
+            </div>
+        </nav>
+
+        <div class="container">
+            <!-- Row 1: Key Stats -->
+            <div class="row">
+                <div class="col-md-3">
+                    <div class="card p-3 text-center border-start border-primary border-5">
+                        <div class="text-uppercase text-muted small fw-bold">Total Runs</div>
+                        <div class="h3 mb-0">{{n_runs}}</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card p-3 text-center border-start border-success border-5">
+                        <div class="text-uppercase text-muted small fw-bold">Files Tracked</div>
+                        <div class="h3 mb-0">{{n_files}}</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card p-3 text-center border-start border-info border-5">
+                        <div class="text-uppercase text-muted small fw-bold">Total Runtime</div>
+                        <div class="h3 mb-0">{{total_runtime}}s</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card p-3 text-center border-start border-warning border-5">
+                        <div class="text-uppercase text-muted small fw-bold">Success Rate</div>
+                        <div class="h3 mb-0">{{success_rate}}%</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row">
+                <!-- Row 2: Charts -->
+                <div class="col-md-8">
+                    <div class="card p-3">
+                        <h5>Runtime Performance (Last 20 Runs)</h5>
+                        <div id="runtimeChart"></div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card p-3">
+                        <h5>Success vs Failure</h5>
+                        <div id="successPie"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row">
+                <!-- Row 3: Lineage Viz -->
+                <div class="col-12">
+                    <div class="card p-3">
+                        <h5>Workflow Lineage</h5>
+                        <div class="mermaid">
+                            {{mermaid_code}}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row">
+                <!-- Row 4: Log Table -->
+                <div class="col-12">
+                    <div class="card p-3">
+                        <h5>Recent Activity Log</h5>
+                        <div class="table-responsive">
+                            <table class="table table-hover align-middle">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Category</th>
+                                        <th>Detail</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for l in logs %}
+                                    <tr>
+                                        <td class="small">{{l.timestamp[5:16]}}</td>
+                                        <td><span class="badge bg-secondary">{{l.category}}</span></td>
+                                        <td>
+                                            {% if l.cmd %}
+                                                <code>{{l.cmd[:80]}}...</code>
+                                            {% else %}
+                                                {{l.content[:100]}}
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            {% if l.exit_code == 0 %}<span class="text-success">✔</span>
+                                            {% elif l.exit_code %}<span class="text-danger">✘ ({{l.exit_code}})</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            // Runtime Chart
+            const runData = {{ runtime_data | tojson }};
+            Plotly.newPlot('runtimeChart', [{
+                x: runData.map(d => d.time),
+                y: runData.map(d => d.val),
+                type: 'bar',
+                marker: { color: '#4e73df' }
+            }], { margin: { t: 10, b: 40, l: 40, r: 10 }, height: 300 });
+
+            // Success Pie
+            Plotly.newPlot('successPie', [{
+                values: [{{success_count}}, {{fail_count}}],
+                labels: ['Success', 'Fail'],
+                type: 'pie',
+                hole: .4,
+                marker: { colors: ['#1cc88a', '#e74a3b'] }
+            }], { margin: { t: 0, b: 0, l: 0, r: 0 }, height: 300 });
+
+            mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+        </script>
+    </body>
+    </html>
+    """
+
+    t = Template(html_template)
+    out = t.render(
+        p_name=p_name,
+        n_runs=n_runs,
+        n_files=n_files,
+        total_runtime=round(total_runtime, 1),
+        success_rate=success_rate,
+        success_count=success_count,
+        fail_count=fail_count,
+        logs=logs,
+        runtime_data=runtime_data,
+        mermaid_code=mermaid_code
+    )
+
+    with open(output, "w") as f:
+        f.write(out)
+    
+    console.print(Panel(f"[green]Beautiful dashboard generated:[/green] [bold]{output}[/bold]", title="Dashboard Ready"))
 
 @app.command()
 def viz(output: str = "workflow.dot"):
