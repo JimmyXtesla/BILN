@@ -345,17 +345,39 @@ def lineage(path: str):
 
 @app.command()
 def compare(id1: int, id2: int):
-    """Compare two runs side-by-side."""
+    """
+    Compare two runs: checks command, runtime, and if output data hashes match.
+    """
     conn = get_db()
-    l1 = conn.execute("SELECT * FROM logs WHERE id = ?", (id1,)).fetchone()
-    l2 = conn.execute("SELECT * FROM logs WHERE id = ?", (id2,)).fetchone()
-    if l1 and l2:
-        table = Table(title=f"Compare {id1} vs {id2}")
-        table.add_column("Metric"); table.add_column(f"Run {id1}"); table.add_column(f"Run {id2}")
-        table.add_row("CMD", l1['cmd'], l2['cmd'])
-        table.add_row("Runtime", str(l1['runtime']), str(l2['runtime']))
-        table.add_row("Git", l1['git_hash'], l2['git_hash'])
-        console.print(table)
+    r1 = conn.execute("SELECT * FROM logs WHERE id = ?", (id1,)).fetchone()
+    r2 = conn.execute("SELECT * FROM logs WHERE id = ?", (id2,)).fetchone()
+    
+    if not r1 or not r2:
+        console.print("[red]One or both Log IDs not found.[/red]")
+        return
+
+    table = Table(title=f"Comparison: Run {id1} vs Run {id2}")
+    table.add_column("Metric", style="bold")
+    table.add_column(f"Run {id1}")
+    table.add_column(f"Run {id2}")
+    table.add_column("Match")
+
+    # Compare Basic Metadata
+    for field in ['cmd', 'tool_version', 'git_hash', 'runtime']:
+        match = "[green]YES[/green]" if r1[field] == r2[field] else "[red]NO[/red]"
+        table.add_row(field.upper(), str(r1[field]), str(r2[field]), match)
+
+    # Compare Data Hashes (The important part)
+    out1 = conn.execute("SELECT f.path, f.hash FROM files f JOIN lineage l ON f.id = l.output_file_id WHERE l.log_id = ?", (id1,)).fetchall()
+    out2 = conn.execute("SELECT f.path, f.hash FROM files f JOIN lineage l ON f.id = l.output_file_id WHERE l.log_id = ?", (id2,)).fetchall()
+
+    h1 = {os.path.basename(r['path']): r['hash'] for r in out1}
+    h2 = {os.path.basename(r['path']): r['hash'] for r in out2}
+
+    for filename in set(h1.keys()) | set(h2.keys()):
+        hash_match = "[green]IDENTICAL[/green]" if h1.get(filename) == h2.get(filename) else "[red]DIFFERENT[/red]"
+        table.add_row(f"FILE: {filename}", "MD5 recorded", "MD5 recorded", hash_match)
+    console.print(table)
 
 @app.command()
 def stats():
@@ -681,12 +703,51 @@ def viz(output: str = "workflow.dot"):
     ))
 
 @app.command()
-def methods():
-    """Draft Methods section text."""
+def methods(detailed: bool = typer.Option(False, "--detailed", help="Include every unique command parameters")):
+    """
+    Generate a professional 'Methods & Materials' draft for your manuscript.
+    """
     p_id, _ = get_active_project()
-    tools = get_db().execute("SELECT DISTINCT tool_version, cmd FROM logs WHERE project_id = ? AND category='RUN'", (p_id,)).fetchall()
-    text = "Analysis performed using: " + ", ".join([f"**{t['cmd'].split()[0]}** ({t['tool_version']})" for t in tools if t['cmd']]) + "."
-    console.print(Panel(Markdown(text), title="Draft Methods"))
+    conn = get_db()
+    
+    # Get unique tool versions
+    tools = conn.execute("""
+        SELECT DISTINCT tool_version, cmd 
+        FROM logs WHERE project_id = ? AND category='RUN'
+    """, (p_id,)).fetchall()
+    
+    if not tools:
+        console.print("[yellow]No runs recorded yet.[/yellow]")
+        return
+
+    # Structure the data
+    software_list = {}
+    for t in tools:
+        if t['cmd']:
+            binary = t['cmd'].split()[0]
+            version = t['tool_version']
+            if binary not in software_list:
+                software_list[binary] = {"version": version, "params": set()}
+            software_list[binary]["params"].add(t['cmd'])
+
+    # Build the paragraph
+    intro = "### Methods & Materials (Draft)\n\n"
+    para = "Data analysis was performed using the BILN-tracked pipeline. "
+    para += "The following software tools were utilized: "
+    
+    tool_strings = [f"**{name}** (version {info['version']})" for name, info in software_list.items()]
+    para += ", ".join(tool_strings) + ". "
+    para += f"Computational reproducibility was managed via a {platform.system()} environment."
+
+    console.print(Panel(Markdown(intro + para), title="Scientific Record", expand=False))
+
+    if detailed:
+        f_text = "\n**Detailed Parameter Log:**\n"
+        for name, info in software_list.items():
+            f_text += f"\n- *{name}* settings:\n"
+            for p in info['params']:
+                f_text += f"  - `{p}`\n"
+        console.print(Markdown(f_text))
 
 @app.command()
 def samples(csv_file: str):
@@ -734,16 +795,46 @@ def archive(dry_run: bool = False):
 
 @app.command()
 def containerize():
-    """Generate Dockerfile from tool history."""
-    p_id, _ = get_active_project()
-    logs = get_db().execute("SELECT cmd FROM logs WHERE project_id = ?", (p_id,)).fetchall()
-    tools = set([l['cmd'].split()[0] for l in logs if l['cmd']])
-    
-    content = "FROM continuumio/miniconda3\nWORKDIR /data\n" + \
-              f"RUN conda install -y -c bioconda {' '.join(tools)}\n"
-    with open("Dockerfile", "w") as f: f.write(content)
-    console.print("[green]Dockerfile generated.[/green]")
+    """
+    Generate a Dockerfile that clones your exact analysis environment.
+    """
+    p_id, name = get_active_project()
+    env_file = BILN_DIR / f"{name}_environment.yml"
 
+    if not env_file.exists():
+        console.print("[red]Error:[/red] No environment snapshot found. Run [bold]biln snapshot[/bold] first.")
+        return
+
+    dockerfile_content = f"""# Generated by BILN for project: {name}
+FROM continuumio/miniconda3
+
+# Set up workspace
+WORKDIR /analysis
+
+# Copy the environment snapshot
+COPY .biln/{name}_environment.yml /tmp/env.yml
+
+# Create the Conda environment
+RUN conda env create -f /tmp/env.yml && conda clean -afy
+
+# Set the environment as the default
+# Replace 'base' with the name found in your yml if necessary
+ENV PATH /opt/conda/envs/$(head -1 /tmp/env.yml | cut -d' ' -f2)/bin:$PATH
+
+# Default command
+CMD ["/bin/bash"]
+"""
+
+    with open("Dockerfile", "w") as f:
+        f.write(dockerfile_content)
+
+    console.print(Panel(
+        f"[green]Dockerfile created successfully![/green]\n\n"
+        "To build your container, run:\n"
+        f"[cyan]docker build -t biln-{name.lower()} .[/cyan]",
+        title="Containerization"
+    ))
+    
 @app.command()
 def doctor():
     """System and project sanity check."""
@@ -767,13 +858,27 @@ def verify():
 
 @app.command()
 def snapshot():
-    """Save Conda environment."""
+    """
+    Export the current Conda environment to a standard YAML file for reproducibility.
+    """
     p_id, name = get_active_project()
-    fname = f".biln/{name}_env.yml"
-    subprocess.run(f"conda env export > {fname}", shell=True)
-    get_db().execute("INSERT INTO logs (project_id, timestamp, category, content) VALUES (?,?,?,?)", (p_id, datetime.now().isoformat(), "SNAPSHOT", fname))
-    get_db().commit()
-    console.print(f"[green]Env saved to {fname}[/green]")
+    # Create the filename
+    env_file = BILN_DIR / f"{name}_environment.yml"
+    
+    console.print(f"[yellow]Capturing Conda environment to {env_file}...[/yellow]")
+    
+    try:
+        # We use --no-builds to make the environment more portable across different machines
+        subprocess.run(f"conda env export --no-builds > {env_file}", shell=True, check=True)
+        
+        conn = get_db()
+        conn.execute("INSERT INTO logs (project_id, timestamp, category, content) VALUES (?,?,?,?)", 
+                     (p_id, datetime.now().isoformat(), "SNAPSHOT", str(env_file)))
+        conn.commit()
+        
+        console.print(f"[bold green]Snapshot successful![/bold green] Use 'biln containerize' to turn this into a Docker image.")
+    except Exception as e:
+        console.print(f"[red]Error capturing environment: {e}[/red]\nEnsure Conda is in your PATH.")
 
 @app.command()
 def export(output: str = "PROVENANCE.md"):
@@ -896,9 +1001,33 @@ def system():
     get_db().execute("INSERT INTO logs (project_id, timestamp, category, content) VALUES (?,?,?,?)", (get_active_project()[0], datetime.now().isoformat(), "SYSTEM", json.dumps(specs))).commit()
 
 @app.command()
-def publish():
-    """Mock publish command."""
-    console.print("[green]Bundle created for sharing.[/green]")
+def publish(output_name: str = "Research_Bundle"):
+    """
+    Bundle the database, documentation, and lineage into a single ZIP for sharing.
+    """
+    p_id, p_name = get_active_project()
+    # First, refresh the docs
+    export(output="PROVENANCE.md")
+    viz(output="workflow.dot")
+    
+    bundle_fn = f"{output_name}_{p_name}_{datetime.now().strftime('%Y%m%d')}"
+    
+    # Create a temporary folder to gather files
+    tmp_dir = Path(f"tmp_{bundle_fn}")
+    tmp_dir.mkdir(exist_ok=True)
+    
+    try:
+        # Copy essential files
+        shutil.copy(DB_PATH, tmp_dir / "biln_notebook.db")
+        shutil.copy("PROVENANCE.md", tmp_dir / "PROVENANCE.md")
+        if os.path.exists("workflow.dot"):
+            shutil.copy("workflow.dot", tmp_dir / "workflow.dot")
+        
+        # Create ZIP
+        shutil.make_archive(bundle_fn, 'zip', tmp_dir)
+        console.print(f"[bold green]Success![/bold green] Bundle created: [white]{bundle_fn}.zip[/white]")
+    finally:
+        shutil.rmtree(tmp_dir)
 
 @app.command()
 def sweep(size: int = 100):
