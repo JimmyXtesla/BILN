@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # BILN - Python-based Interactive Lab Notebook for Bioinformaticians
 # Author: Jimmy X Banda.
-# Version: 1.0 (2025) - Updated File Tracking
+# Version: 1.0 (2025) 
 
 import psutil
 import os

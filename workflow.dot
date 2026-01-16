@@ -1,0 +1,9 @@
+digraph "TrackingTest" {
+    rankdir="LR";
+    node [shape=box, style="filled, rounded", fillcolor="#E8F0FE", fontname="Arial"];
+    edge [fontname="Verdana", fontsize=10];
+
+    "raw_data.txt" -> "results.txt" [label=" cp "];
+    "r1.fq" -> "merged.fq" [label=" cat "];
+    "r2.fq" -> "merged.fq" [label=" cat "];
+}
