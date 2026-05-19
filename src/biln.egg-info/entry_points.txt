@@ -1,0 +1,2 @@
+[console_scripts]
+biln = biln.main:main
